@@ -141,6 +141,39 @@ def exact_match_score(prediction, ground_truth):
 def ems(prediction, ground_truths):
     return max([exact_match_score(prediction, gt) for gt in ground_truths])
 
+def get_exact_match(answers1, answers2):
+    if type(answers1)==list:
+        if len(answers1)==0:
+            return 0
+        return np.max([get_exact_match(a, answers2) for a in answers1])
+    if type(answers2)==list:
+        if len(answers2)==0:
+            return 0
+        return np.max([get_exact_match(answers1, a) for a in answers2])
+    return normalize_answer(answers1) == normalize_answer(answers2)
+
+def get_f1(answers, predictions, is_equal=get_exact_match):
+    '''
+    :answers: a list of list of strings
+    :predictions: a list of strings
+    '''
+    assert len(answers)>0 and len(predictions)>0, (answers, predictions)
+    occupied_answers = [False for _ in answers]
+    occupied_predictions = [False for _ in predictions]
+    for i, answer in enumerate(answers):
+        for j, prediction in enumerate(predictions):
+            if occupied_answers[i] or occupied_predictions[j]:
+                continue
+            em = is_equal(answer, prediction)
+            if em:
+                occupied_answers[i] = True
+                occupied_predictions[j] = True
+    assert np.sum(occupied_answers)==np.sum(occupied_predictions)
+    a, b = np.mean(occupied_answers), np.mean(occupied_predictions)
+    if a+b==0:
+        return 0
+    return 2*a*b/(a+b)
+
 ####################################################
 ########        RETRIEVER EVALUATION        ########
 ####################################################

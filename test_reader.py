@@ -28,6 +28,7 @@ def evaluate(model, dataset, dataloader, tokenizer, opt):
         model.overwrite_forward_crossattention()
         model.reset_score_storage() 
     total = 0
+    f1_scores = []
     exactmatch = []
     if opt.write_results:
         write_path = Path(opt.checkpoint_dir) / opt.name / 'test_results'
@@ -49,11 +50,36 @@ def evaluate(model, dataset, dataloader, tokenizer, opt):
                 crossattention_scores = model.get_crossattention_scores(context_mask.cuda())
 
             for k, o in enumerate(outputs):
-                ans = tokenizer.decode(o, skip_special_tokens=True)
+                ans = tokenizer.decode(o, skip_special_tokens=False)
+                for special_token in tokenizer.all_special_tokens:
+                    if special_token != '<extra_id_0>':
+                        ans = ans.replace(special_token, '')
+                ans_list = ans.split('<extra_id_0>')
                 example = dataset.data[idx[k]]
                 if 'answers' in example:
-                    score = src.evaluation.ems(ans, example['answers'])
-                    exactmatch.append(score)
+
+                    annotations = example['answers']
+                    max_f1 = 0
+                    max_ems = 0
+                    for annotation in annotations:
+                        # iterate each annotation and take the maximum metrics
+                        if annotation['type'] == 'singleAnswer':
+                            f1 = src.evaluation.get_f1([annotation['answer']], ans_list)
+                            max_f1 = max(max_f1, f1)
+
+                            ems = src.evaluation.get_exact_match(annotation['answer'], ans_list)
+                            max_ems = max(max_ems, ems)
+                        elif annotation['type'] == 'multipleQAs':
+                            max_f1 = max(max_f1,
+                                         src.evaluation.get_f1([answer['answer'] for answer in annotation['qaPairs']],
+                                                               ans_list))
+
+                            ems = src.evaluation.get_exact_match([answer['answer'] for answer in annotation['qaPairs']],
+                                                                 ans_list)
+                            max_ems = max(max_ems, ems)
+
+                    exactmatch.append(max_ems)
+                    f1_scores.append(max_f1)
 
                 if opt.write_results:
                     fw.write(str(example['id']) + "\t" + ans + '\n')
@@ -67,10 +93,11 @@ def evaluate(model, dataset, dataloader, tokenizer, opt):
                 if len(exactmatch) == 0:
                     log += '| no answer to compute scores'
                 else:
-                    log += f' | average = {np.mean(exactmatch):.3f}'
+                    log += f' | average f1 = {np.mean(f1_scores):.3f}'
+                    log += f' | average em = {np.mean(exactmatch):.3f}'
                 logger.warning(log)
 
-    logger.warning(f'Process rank:{opt.global_rank}, total {total} | average = {np.mean(exactmatch):.3f}')
+    logger.warning(f'Process rank:{opt.global_rank}, total {total} | average = {np.mean(f1_scores):.3f}')
     if opt.is_distributed:
         torch.distributed.barrier()
     score, total = src.util.weighted_average(np.mean(exactmatch), total, opt)

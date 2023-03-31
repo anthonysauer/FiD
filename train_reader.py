@@ -8,6 +8,7 @@ import time
 import sys
 import torch
 import transformers
+import wandb
 import numpy as np
 from pathlib import Path
 from torch.utils.data import DataLoader, RandomSampler, DistributedSampler, SequentialSampler
@@ -20,7 +21,7 @@ import src.data
 import src.model
 
 
-def train(model, optimizer, scheduler, step, train_dataset, eval_dataset, opt, collator, best_dev_em, checkpoint_path):
+def train(model, optimizer, scheduler, step, train_dataset, eval_dataset, opt, collator, best_dev_f1, checkpoint_path):
 
     if opt.is_main:
         try:
@@ -66,27 +67,40 @@ def train(model, optimizer, scheduler, step, train_dataset, eval_dataset, opt, c
             train_loss = src.util.average_main(train_loss, opt)
             curr_loss += train_loss.item()
 
+            if step % opt.accumulation_steps == 0:
+                log = f"{step} / {opt.total_steps} |"
+                log += f"train: {curr_loss / opt.accumulation_steps:.3f} |"
+                log += f"lr: {scheduler.get_last_lr()[0]:.5f}"
+                logger.info(log)
+                wandb.log({"loss": curr_loss/opt.accumulation_steps, "global_step": step})
+
+                if tb_logger is not None:
+                    tb_logger.add_scalar("Training", curr_loss / (opt.accumulation_steps), step)
+
+                curr_loss = 0.
+
             if step % opt.eval_freq == 0:
-                dev_em = evaluate(model, eval_dataset, tokenizer, collator, opt)
+                dev_f1, dev_em = evaluate(model, eval_dataset, tokenizer, collator, opt)
                 model.train()
                 if opt.is_main:
-                    if dev_em > best_dev_em:
-                        best_dev_em = dev_em
-                        src.util.save(model, optimizer, scheduler, step, best_dev_em,
-                                  opt, checkpoint_path, 'best_dev')
+                    if dev_f1 > best_dev_f1:
+                        best_dev_f1 = dev_f1
+                        src.util.save(model, optimizer, scheduler, step, best_dev_f1,
+                                      opt, checkpoint_path, 'best_dev')
                     log = f"{step} / {opt.total_steps} |"
-                    log += f"train: {curr_loss/opt.eval_freq:.3f} |"
+                    log += f"evaluation: {dev_f1:.2f}F1 |"
                     log += f"evaluation: {100*dev_em:.2f}EM |"
                     log += f"lr: {scheduler.get_last_lr()[0]:.5f}"
-                    logger.info(log)    
+                    logger.info(log)
+
+                    wandb.log({"f1": dev_f1, "ems": 100*dev_em, "global_step": step})
+
                     if tb_logger is not None:
-                        tb_logger.add_scalar("Evaluation", dev_em, step)
-                        tb_logger.add_scalar("Training", curr_loss / (opt.eval_freq), step)
-                    curr_loss = 0.
+                        tb_logger.add_scalar("Evaluation", dev_f1, step)
 
             if opt.is_main and step % opt.save_freq == 0:
-                src.util.save(model, optimizer, scheduler, step, best_dev_em,
-                          opt, checkpoint_path, f"step-{step}")
+                src.util.save(model, optimizer, scheduler, step, best_dev_f1,
+                              opt, checkpoint_path, f"step-{step}")
             if step > opt.total_steps:
                 break
 
@@ -101,6 +115,8 @@ def evaluate(model, dataset, tokenizer, collator, opt):
     )
     model.eval()
     total = 0
+    total_multi = 0
+    f1_scores = []
     exactmatch = []
     model = model.module if hasattr(model, "module") else model
     with torch.no_grad():
@@ -114,14 +130,46 @@ def evaluate(model, dataset, tokenizer, collator, opt):
             )
 
             for k, o in enumerate(outputs):
-                ans = tokenizer.decode(o, skip_special_tokens=True)
-                gold = dataset.get_example(idx[k])['answers']
-                score = src.evaluation.ems(ans, gold)
-                total += 1
-                exactmatch.append(score)
+                ans = tokenizer.decode(o, skip_special_tokens=False)
+                for special_token in tokenizer.all_special_tokens:
+                    if special_token != '<extra_id_0>':
+                        ans = ans.replace(special_token, '')
+                if '<extra_id_0>' in ans:
+                    total_multi += 1
+                ans_list = ans.split('<extra_id_0>')
+                ans_list_stripped = [s.strip() for s in ans_list]
+                if total < 10:
+                    logger.info('Sample answers: ' + '; '.join(ans_list_stripped))
 
+                annotations = dataset.get_example(idx[k])['answers']
+
+                max_f1 = 0
+                max_ems = 0
+                for annotation in annotations:
+                    # iterate each annotation and take the maximum metrics
+                    if annotation['type'] == 'singleAnswer':
+                        f1 = src.evaluation.get_f1([annotation['answer']], ans_list_stripped)
+                        max_f1 = max(max_f1, f1)
+
+                        ems = src.evaluation.get_exact_match(annotation['answer'], ans_list_stripped)
+                        max_ems = max(max_ems, ems)
+                    elif annotation['type'] == 'multipleQAs':
+                        max_f1 = max(max_f1,
+                                     src.evaluation.get_f1([answer['answer'] for answer in annotation['qaPairs']],
+                                                           ans_list_stripped))
+
+                        ems = src.evaluation.get_exact_match([answer['answer'] for answer in annotation['qaPairs']],
+                                                             ans_list_stripped)
+                        max_ems = max(max_ems, ems)
+
+                total += 1
+                exactmatch.append(max_ems)
+                f1_scores.append(max_f1)
+
+    logger.info('Total number of multi answers: ' + str(total_multi))
+    f1_scores, total = src.util.weighted_average(np.mean(f1_scores), total, opt)
     exactmatch, total = src.util.weighted_average(np.mean(exactmatch), total, opt)
-    return exactmatch
+    return f1_scores, exactmatch
 
 if __name__ == "__main__":
     options = Options()
@@ -177,14 +225,14 @@ if __name__ == "__main__":
         model.load_t5(t5.state_dict())
         model = model.to(opt.local_rank)
         optimizer, scheduler = src.util.set_optim(opt, model)
-        step, best_dev_em = 0, 0.0
+        step, best_dev_f1 = 0, 0.0
     elif opt.model_path == "none":
         load_path = checkpoint_path / 'checkpoint' / 'latest'
-        model, optimizer, scheduler, opt_checkpoint, step, best_dev_em = \
+        model, optimizer, scheduler, opt_checkpoint, step, best_dev_f1 = \
             src.util.load(model_class, load_path, opt, reset_params=False)
         logger.info(f"Model loaded from {load_path}")
     else:
-        model, optimizer, scheduler, opt_checkpoint, step, best_dev_em = \
+        model, optimizer, scheduler, opt_checkpoint, step, best_dev_f1 = \
             src.util.load(model_class, opt.model_path, opt, reset_params=True)
         logger.info(f"Model loaded from {opt.model_path}")
 
@@ -198,6 +246,19 @@ if __name__ == "__main__":
             find_unused_parameters=False,
         )
 
+    wandb.init(
+        # set the wandb project where this run will be logged
+        project="multi-answer-ir",
+
+        # track hyperparameters and run metadata
+        config={
+            "learning_rate": 0.001,
+            "dataset": "ambignq",
+            "total_steps": 6000,
+            "warmup_steps": 500
+        }
+    )
+
     logger.info("Start training")
     train(
         model,
@@ -208,6 +269,8 @@ if __name__ == "__main__":
         eval_dataset,
         opt,
         collator,
-        best_dev_em,
+        best_dev_f1,
         checkpoint_path
     )
+
+    wandb.finish()
